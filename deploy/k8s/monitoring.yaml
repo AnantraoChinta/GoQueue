@@ -1,0 +1,25 @@
+# PLACEHOLDER - Prometheus and Grafana inside the cluster.
+#
+# Deliberately empty. During local development, monitoring runs in Docker
+# Compose instead (`make compose-up`); this file is for the in-cluster
+# version.
+#
+# Objects needed:
+#
+#   Prometheus
+#     - Deployment + ConfigMap + Service (NodePort 30090 -> localhost:19090)
+#     - ServiceAccount + ClusterRole + ClusterRoleBinding. Prometheus needs
+#       RBAC permission to list pods, services and endpoints before
+#       kubernetes_sd_configs will work.
+#     - The in-cluster scrape config differs from deploy/prometheus.yml: it
+#       must use kubernetes_sd_configs with a pod-label relabel rule,
+#       because worker pods come and go as the Deployment scales and static
+#       targets cannot follow them.
+#
+#   Grafana
+#     - Deployment + Service (NodePort 30030 -> localhost:13000)
+#     - ConfigMap for datasource provisioning pointing at the in-cluster
+#       Prometheus Service
+#
+# Consider the kube-prometheus-stack Helm chart instead of hand-rolling all
+# of this once the project outgrows a demo.

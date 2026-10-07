@@ -1,0 +1,31 @@
+# PLACEHOLDER - the GoQueue HTTP API that accepts job submissions.
+#
+# Deliberately empty: there is no scheduler binary yet. Uncomment and fill
+# in once cmd/scheduler does something. `kubectl apply -f deploy/k8s/`
+# ignores a file with no YAML documents in it.
+#
+# Objects needed:
+#
+#   Deployment  scheduler
+#     - replicas: 2+. The scheduler is stateless, so this is purely about
+#       availability during rolling updates.
+#     - env REDIS_ADDR: redis.goqueue.svc.cluster.local:6379
+#     - livenessProbe  -> GET /healthz
+#       Process health ONLY. It must NOT check Redis: if it did, a brief
+#       Redis outage would make Kubernetes restart every scheduler pod,
+#       turning a dependency blip into an outage of your own.
+#     - readinessProbe -> GET /readyz
+#       May check Redis. Failing it removes the pod from the Service
+#       endpoints without restarting it, which is the behaviour you want.
+#     - resources.requests for cpu and memory
+#     - securityContext: runAsNonRoot, readOnlyRootFilesystem,
+#       capabilities.drop ALL (the distroless image already runs as uid
+#       65532; this makes the cluster enforce it too)
+#
+#   Service     scheduler
+#     - type: NodePort, nodePort: 30080
+#       Must be 30080 to match the extraPortMapping in
+#       deploy/kind-config.yaml, which forwards it to localhost:8080.
+#
+#   ConfigMap   scheduler-config
+#     - non-secret settings: Redis address, log level, listen port

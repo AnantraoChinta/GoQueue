@@ -1,0 +1,132 @@
+# Redis for the GoQueue job queue (local kind development).
+#
+#   kubectl apply -f deploy/k8s/redis.yaml
+#
+# NOTE ON Deployment vs StatefulSet
+# ---------------------------------
+# This is a Deployment with an emptyDir volume, which means the queue is
+# WIPED whenever the pod is rescheduled. That is acceptable for local
+# development and nothing else.
+#
+# A real deployment needs a StatefulSet with a volumeClaimTemplate: only
+# that gives Redis a stable identity and a PersistentVolume that survives
+# rescheduling. With the Deployment below, a node drain silently discards
+# every queued job - which directly contradicts GoQueue's "no job is lost"
+# guarantee. Swap it before this runs anywhere that matters.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: goqueue
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/part-of: goqueue
+    app.kubernetes.io/component: queue
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: two Redis pods must never hold the same
+  # data directory, and a rolling update would briefly run both.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+        app.kubernetes.io/part-of: goqueue
+    spec:
+      # Redis holds queue state in memory; give it a moment to flush its
+      # append-only file on shutdown rather than being killed instantly.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999          # the "redis" user in the official image
+        runAsGroup: 999
+        fsGroup: 999            # makes the mounted volume group-writable
+      containers:
+        - name: redis
+          image: redis:8-alpine
+          imagePullPolicy: IfNotPresent
+          args:
+            - redis-server
+            - --appendonly
+            - "yes"
+            # CRITICAL for a job queue: the default eviction policy will
+            # silently delete keys under memory pressure. For a cache that
+            # is correct; for a queue it means losing jobs. noeviction makes
+            # Redis reject writes instead, so the scheduler gets a visible
+            # error rather than a silent data loss.
+            - --maxmemory-policy
+            - noeviction
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          # Liveness: is the Redis process wedged? Restart only then.
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # Readiness: should the Service send traffic here yet? Failing
+          # this removes the pod from the Service endpoints without
+          # restarting it.
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            # requests is what the scheduler uses to place the pod; without
+            # it Kubernetes assumes zero and can overcommit a node.
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            # No CPU limit on purpose: a CPU limit throttles rather than
+            # kills, and a throttled Redis adds latency to every job claim.
+            # The memory limit is a real ceiling - exceed it and the kernel
+            # OOM-kills the container.
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        # emptyDir lives on the node and dies with the pod. See the note at
+        # the top of this file.
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: goqueue
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/part-of: goqueue
+spec:
+  # ClusterIP, not NodePort: Redis is reachable only from inside the
+  # cluster. In-cluster clients address it as
+  #   redis.goqueue.svc.cluster.local:6379
+  # or simply "redis:6379" from a pod in the same namespace.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP

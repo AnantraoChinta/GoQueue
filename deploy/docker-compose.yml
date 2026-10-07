@@ -1,0 +1,64 @@
+# Local development dependencies for GoQueue.
+#
+# This brings up only the *backing services* - Redis, Prometheus, Grafana.
+# The scheduler and worker are expected to run on the host (`make run`) so
+# you get fast rebuilds without a container round-trip.
+#
+#   make compose-up     start everything
+#   make compose-down   stop and remove, including volumes
+
+name: goqueue
+
+services:
+  redis:
+    image: redis:8-alpine
+    container_name: goqueue-redis
+    # appendonly makes Redis durable across restarts, which matters because
+    # the whole point of the queue is that jobs survive a crash.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    container_name: goqueue-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      # Needed so `make compose-up` can be re-run against a changed
+      # prometheus.yml without restarting the container:
+      #   curl -X POST http://localhost:9090/-/reload
+      - "--web.enable-lifecycle"
+
+  grafana:
+    image: grafana/grafana:12.3.1
+    container_name: goqueue-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      # Local dev only. Never use these settings outside a laptop.
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  redis-data:
+  prometheus-data:
+  grafana-data:

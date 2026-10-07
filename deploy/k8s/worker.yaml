@@ -1,0 +1,30 @@
+# PLACEHOLDER - the GoQueue worker pool that executes jobs.
+#
+# Deliberately empty: there is no worker binary yet. Uncomment and fill in
+# once cmd/worker does something.
+#
+# Objects needed:
+#
+#   Deployment  worker
+#     - env REDIS_ADDR: redis.goqueue.svc.cluster.local:6379
+#     - env WORKER_POOL_SIZE: goroutines per pod. Total concurrency is
+#       replicas x pool size; it is easy to accidentally overwhelm Redis by
+#       scaling both at once.
+#     - terminationGracePeriodSeconds: must exceed your longest job, or
+#       Kubernetes SIGKILLs mid-job on every rolling update and forces a
+#       redelivery. The 30s default is almost certainly too short.
+#     - preStop hook: stop claiming new jobs before SIGTERM arrives, so the
+#       pod drains instead of abandoning work.
+#     - NO livenessProbe on queue activity. An idle worker is healthy, not
+#       broken; probing "have you processed a job recently" will restart
+#       perfectly good pods whenever the queue is empty.
+#
+#   Service     worker-metrics
+#     - type: ClusterIP, port 8081, for Prometheus to scrape. Workers take
+#       no inbound traffic otherwise.
+#
+#   HorizontalPodAutoscaler  worker   (later)
+#     - Scale on goqueue_queue_depth via prometheus-adapter, NOT on CPU.
+#       A worker blocked on network I/O burns almost no CPU while the
+#       backlog grows, so CPU-based autoscaling will sit at 1 replica
+#       exactly when you need 20.

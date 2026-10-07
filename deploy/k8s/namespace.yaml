@@ -1,0 +1,8 @@
+# All GoQueue objects live in this namespace, so the entire deployment can
+# be removed with a single `kubectl delete namespace goqueue`.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: goqueue
+  labels:
+    app.kubernetes.io/name: goqueue

@@ -51,3 +51,6 @@ kubeconfig.*
 *.swp
 *.swo
 *~
+
+# Claude Code workspace (local agent config and notes; not shared)
+.claude/

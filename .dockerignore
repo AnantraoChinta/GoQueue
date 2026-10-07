@@ -1,0 +1,15 @@
+.git
+.gitignore
+.github
+.claude
+README.md
+Makefile
+deploy/
+bin/
+dist/
+*.md
+*.test
+coverage.*
+.DS_Store
+.idea/
+.vscode/

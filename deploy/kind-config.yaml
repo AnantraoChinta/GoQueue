@@ -1,0 +1,39 @@
+# kind cluster definition for GoQueue local development.
+#
+#   make kind-up     create this cluster
+#   make kind-down   delete it
+#
+# Three nodes rather than kind's single-node default. A one-node cluster
+# makes every pod "co-located" by accident, which hides scheduling,
+# anti-affinity and cross-node networking mistakes until you deploy
+# somewhere real.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: goqueue
+
+nodes:
+  - role: control-plane
+    # Forward host ports into the cluster so services are reachable without
+    # running `kubectl port-forward` in a spare terminal. The containerPort
+    # here must match the nodePort set on the corresponding Service.
+    #
+    # Host ports are deliberately offset from the Docker Compose stack
+    # (9090/3000) so both can run at once without colliding.
+    extraPortMappings:
+      - containerPort: 30080   # scheduler API   -> http://localhost:8080
+        hostPort: 8080
+        protocol: TCP
+      - containerPort: 30090   # Prometheus      -> http://localhost:19090
+        hostPort: 19090
+        protocol: TCP
+      - containerPort: 30030   # Grafana         -> http://localhost:13000
+        hostPort: 13000
+        protocol: TCP
+
+  - role: worker
+  - role: worker
+
+# Note: Redis is intentionally NOT exposed to the host. Nothing outside the
+# cluster should reach it directly; the scheduler and workers talk to it over
+# the in-cluster Service DNS name. To inspect it by hand, use
+#   kubectl -n goqueue port-forward svc/redis 6379:6379

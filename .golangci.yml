@@ -1,0 +1,52 @@
+# golangci-lint configuration for GoQueue.
+# Schema version 2 (golangci-lint 2.x); v1 configs do not load here.
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  # "standard" = errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+  enable:
+    - bodyclose      # HTTP response bodies must be closed or connections leak
+    - errorlint      # correct use of errors.Is/As and %w wrapping
+    - misspell
+    - revive         # style and naming
+    - unconvert      # redundant type conversions
+    - usestdlibvars  # e.g. http.MethodGet over the string "GET"
+
+  settings:
+    revive:
+      rules:
+        # Disabled permanently, not just for scaffolding. Go routinely forces
+        # unused parameters: satisfying an interface, http.HandlerFunc
+        # signatures, callbacks that ignore an argument. Renaming them all to
+        # `_` loses the documentation value of the parameter name, and the
+        # rule cannot tell a deliberate ignore from an oversight.
+        - name: unused-parameter
+          disabled: true
+
+  exclusions:
+    rules:
+      # TEMPORARY (scaffolding, 2026-10-07): the placeholder structs declare
+      # fields that nothing reads yet. Those declarations are deliberate -
+      # they are what keeps go-redis in go.mod through `go mod tidy`.
+      # DELETE this rule as soon as internal/queue is implemented.
+      - path: 'internal/queue/queue\.go'
+        linters:
+          - unused
+
+      # Test files may use dot-imports and skip error checks for brevity.
+      - path: '_test\.go'
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/anantraochinta/goqueue

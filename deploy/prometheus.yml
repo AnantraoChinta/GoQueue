@@ -1,0 +1,37 @@
+# Prometheus scrape configuration for local GoQueue development.
+#
+# Mounted read-only into the Prometheus container at
+# /etc/prometheus/prometheus.yml by deploy/docker-compose.yml.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    env: local
+
+scrape_configs:
+  # Prometheus scraping itself. Useful as a known-good target: if this one
+  # is DOWN, the problem is Prometheus, not your app.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # The scheduler and worker run on the *host* during local development,
+  # not in Compose. host.docker.internal is the Docker Desktop DNS name for
+  # the host as seen from inside a container; on Linux, add
+  #   extra_hosts: ["host.docker.internal:host-gateway"]
+  # to the prometheus service in docker-compose.yml.
+  #
+  # These targets will show as DOWN until the binaries exist and expose
+  # /metrics. That is expected at this stage of the project.
+  - job_name: goqueue-scheduler
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+
+  - job_name: goqueue-worker
+    static_configs:
+      - targets: ["host.docker.internal:8081"]
+
+# TODO: once running in kind, replace the static_configs above with
+# kubernetes_sd_configs so that worker pods are discovered automatically as
+# they scale up and down. Static targets cannot track a Deployment.
