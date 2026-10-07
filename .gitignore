@@ -1,0 +1,53 @@
+# Binaries and build output
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+/dist/
+/build/
+
+# Test binaries and coverage
+*.test
+*.out
+coverage.*
+/coverage/
+
+# Go workspace file (machine-specific; not committed)
+go.work
+go.work.sum
+
+# Dependency directory (only present with legacy vendoring)
+/vendor/
+
+# Go build/test caches, if ever placed in-tree
+.gocache/
+
+# golangci-lint cache
+.golangci-cache/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Kubernetes / local cluster artifacts
+kubeconfig
+kubeconfig.*
+*.kubeconfig
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
