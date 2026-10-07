@@ -54,3 +54,4 @@ kubeconfig.*
 
 # Claude Code workspace (local agent config and notes; not shared)
 .claude/
+CLAUDE.md
