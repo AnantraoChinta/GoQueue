@@ -1,30 +1,115 @@
-# PLACEHOLDER - the GoQueue worker pool that executes jobs.
-#
-# Deliberately empty: there is no worker binary yet. Uncomment and fill in
-# once cmd/worker does something.
-#
-# Objects needed:
-#
-#   Deployment  worker
-#     - env REDIS_ADDR: redis.goqueue.svc.cluster.local:6379
-#     - env WORKER_POOL_SIZE: goroutines per pod. Total concurrency is
-#       replicas x pool size; it is easy to accidentally overwhelm Redis by
-#       scaling both at once.
-#     - terminationGracePeriodSeconds: must exceed your longest job, or
-#       Kubernetes SIGKILLs mid-job on every rolling update and forces a
-#       redelivery. The 30s default is almost certainly too short.
-#     - preStop hook: stop claiming new jobs before SIGTERM arrives, so the
-#       pod drains instead of abandoning work.
-#     - NO livenessProbe on queue activity. An idle worker is healthy, not
-#       broken; probing "have you processed a job recently" will restart
-#       perfectly good pods whenever the queue is empty.
-#
-#   Service     worker-metrics
-#     - type: ClusterIP, port 8081, for Prometheus to scrape. Workers take
-#       no inbound traffic otherwise.
-#
-#   HorizontalPodAutoscaler  worker   (later)
-#     - Scale on goqueue_queue_depth via prometheus-adapter, NOT on CPU.
-#       A worker blocked on network I/O burns almost no CPU while the
-#       backlog grows, so CPU-based autoscaling will sit at 1 replica
-#       exactly when you need 20.
+# The GoQueue worker pool that executes jobs.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker-metrics
+  namespace: goqueue
+  labels:
+    app.kubernetes.io/name: worker
+    app.kubernetes.io/part-of: goqueue
+spec:
+  # ClusterIP: workers take no inbound traffic. This Service exists only so
+  # Prometheus has something to discover and scrape.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: worker
+  ports:
+    - name: metrics
+      port: 8081
+      targetPort: metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: goqueue
+  labels:
+    app.kubernetes.io/name: worker
+    app.kubernetes.io/part-of: goqueue
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: worker
+  template:
+    metadata:
+      annotations:
+        # Opt in to the annotation-driven discovery in monitoring.yaml.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: "/metrics"
+      labels:
+        app.kubernetes.io/name: worker
+        app.kubernetes.io/part-of: goqueue
+    spec:
+      # Must exceed the pool's job timeout. The pool detaches a running
+      # job from the shutdown signal and lets it finish, bounded by
+      # -job-timeout (30s here); a shorter grace period would SIGKILL
+      # mid-job and force a redelivery on every rolling update.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: worker
+          image: goqueue-worker:dev
+          imagePullPolicy: Never
+          env:
+            - name: GOQUEUE_REDIS_ADDR
+              value: redis.goqueue.svc.cluster.local:6379
+            - name: GOQUEUE_METRICS_ADDR
+              value: ":8081"
+            - name: GOQUEUE_POOL_SIZE
+              value: "5"
+            - name: GOQUEUE_JOB_TIMEOUT
+              value: "30s"
+            # Must exceed job timeout, or a healthy long-running job gets
+            # reclaimed and executed twice.
+            - name: GOQUEUE_CLAIM_TTL
+              value: "60s"
+            # The pod name, so a claim records which pod holds it.
+            - name: GOQUEUE_WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: metrics
+              containerPort: 8081
+          # startupProbe gives the container a generous window to come up
+          # while Redis is still appearing. Liveness and readiness are
+          # suspended until this first succeeds, so a slow start cannot be
+          # mistaken for a wedged process. 2s x 45 = 90s, which exceeds the
+          # 60s -redis-connect-timeout.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 2
+            failureThreshold: 45
+          # Liveness only. Deliberately NOT a check on recent job activity:
+          # an idle worker is healthy, and probing "have you processed a
+          # job lately" would restart perfectly good pods whenever the
+          # queue is empty.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+# TODO: HorizontalPodAutoscaler keyed on goqueue_queue_depth via
+# prometheus-adapter, NOT on CPU. A worker blocked on network I/O burns
+# almost no CPU while the backlog grows, so CPU-based autoscaling sits at
+# minReplicas exactly when you need to scale out.

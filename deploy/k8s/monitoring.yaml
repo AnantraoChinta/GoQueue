@@ -1,25 +1,282 @@
-# PLACEHOLDER - Prometheus and Grafana inside the cluster.
+# In-cluster Prometheus and Grafana.
 #
-# Deliberately empty. During local development, monitoring runs in Docker
-# Compose instead (`make compose-up`); this file is for the in-cluster
-# version.
+# This config differs from deploy/prometheus.yml in one important way: it
+# uses kubernetes_sd_configs instead of static targets. Worker pods come and
+# go as the Deployment scales, and a static target list cannot follow them -
+# it would scrape dead IPs and miss new pods entirely.
 #
-# Objects needed:
-#
-#   Prometheus
-#     - Deployment + ConfigMap + Service (NodePort 30090 -> localhost:19090)
-#     - ServiceAccount + ClusterRole + ClusterRoleBinding. Prometheus needs
-#       RBAC permission to list pods, services and endpoints before
-#       kubernetes_sd_configs will work.
-#     - The in-cluster scrape config differs from deploy/prometheus.yml: it
-#       must use kubernetes_sd_configs with a pod-label relabel rule,
-#       because worker pods come and go as the Deployment scales and static
-#       targets cannot follow them.
-#
-#   Grafana
-#     - Deployment + Service (NodePort 30030 -> localhost:13000)
-#     - ConfigMap for datasource provisioning pointing at the in-cluster
-#       Prometheus Service
-#
-# Consider the kube-prometheus-stack Helm chart instead of hand-rolling all
-# of this once the project outgrows a demo.
+# Discovery is annotation-driven: a pod opts in with prometheus.io/scrape.
+# That keeps the scrape config generic, so a new component needs annotations
+# on its pod template and nothing here.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: goqueue
+---
+# kubernetes_sd_configs calls the Kubernetes API, which needs RBAC.
+# Read-only, and only the object kinds discovery actually reads.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: goqueue-prometheus
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "services", "endpoints", "pods"]
+    verbs: ["get", "list", "watch"]
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: goqueue-prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: goqueue-prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: goqueue
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: goqueue
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 10s
+      evaluation_interval: 10s
+      external_labels:
+        cluster: kind-goqueue
+
+    rule_files:
+      - /etc/prometheus/rules.yml
+
+    scrape_configs:
+      # Prometheus scraping itself: a known-good control. If this target is
+      # down the problem is Prometheus, not your application.
+      - job_name: prometheus
+        static_configs:
+          - targets: ["localhost:9090"]
+
+      # Every pod carrying prometheus.io/scrape: "true".
+      - job_name: goqueue-pods
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [goqueue]
+        relabel_configs:
+          # Opt in.
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          # Honour a custom metrics path.
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          # Replace the discovered port with the annotated one. Discovery
+          # yields one target per declared containerPort; without this the
+          # scrape would hit whichever port came first.
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          # Carry useful identity onto every series. Without pod, you
+          # cannot tell which replica produced a value.
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            action: replace
+            target_label: component
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: namespace
+  rules.yml: |
+    groups:
+      - name: goqueue
+        interval: 10s
+        rules:
+          # goqueue_queue_depth is a property of the QUEUE, but every
+          # worker pod samples the same Redis and reports the same number.
+          # sum() would multiply the real depth by the replica count, so a
+          # scaled-up deployment would appear to have a bigger backlog
+          # purely because it scaled. max() is the correct aggregation.
+          #
+          # Encoding it as a recording rule means dashboards and the
+          # autoscaler consume a value that is already right.
+          - record: goqueue:queue_depth:max
+            expr: max by (state) (goqueue_queue_depth)
+
+          - record: goqueue:jobs_processed:rate5m
+            expr: sum by (type, outcome) (rate(goqueue_jobs_processed_total[5m]))
+
+          - record: goqueue:job_duration_seconds:p95
+            expr: >
+              histogram_quantile(0.95,
+                sum by (type, le) (rate(goqueue_job_duration_seconds_bucket[5m])))
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: goqueue
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: goqueue
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: prometheus
+        app.kubernetes.io/part-of: goqueue
+    spec:
+      serviceAccountName: prometheus
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534   # nobody, the user the prom/prometheus image expects
+        fsGroup: 65534
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.7.3
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            # Local dev only; a short retention keeps the emptyDir small.
+            - --storage.tsdb.retention.time=2h
+            - --web.enable-lifecycle
+          ports:
+            - name: http
+              containerPort: 9090
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /-/healthy, port: http }
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus }
+            - { name: data, mountPath: /prometheus }
+      volumes:
+        - name: config
+          configMap: { name: prometheus-config }
+        # emptyDir: metrics history is disposable in a dev cluster. A real
+        # deployment needs a PersistentVolumeClaim here.
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: goqueue
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http
+      # Matches the extraPortMapping in kind-config.yaml -> localhost:19090
+      nodePort: 30090
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-provisioning
+  namespace: goqueue
+data:
+  datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus.goqueue.svc.cluster.local:9090
+        isDefault: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: goqueue
+  labels:
+    app.kubernetes.io/name: grafana
+    app.kubernetes.io/part-of: goqueue
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: grafana
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: grafana
+        app.kubernetes.io/part-of: goqueue
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 472   # the grafana user in the official image
+        fsGroup: 472
+      containers:
+        - name: grafana
+          image: grafana/grafana:12.3.1
+          env:
+            # Local development only. Never outside a laptop or kind.
+            - { name: GF_SECURITY_ADMIN_USER, value: admin }
+            - { name: GF_SECURITY_ADMIN_PASSWORD, value: admin }
+            - { name: GF_AUTH_ANONYMOUS_ENABLED, value: "true" }
+            - { name: GF_AUTH_ANONYMOUS_ORG_ROLE, value: Admin }
+          ports:
+            - name: http
+              containerPort: 3000
+          readinessProbe:
+            httpGet: { path: /api/health, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - name: provisioning
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: data
+              mountPath: /var/lib/grafana
+      volumes:
+        - name: provisioning
+          configMap: { name: grafana-provisioning }
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: goqueue
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: grafana
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+      # Matches the extraPortMapping in kind-config.yaml -> localhost:13000
+      nodePort: 30030

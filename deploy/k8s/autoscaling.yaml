@@ -1,0 +1,213 @@
+# Worker autoscaling driven by queue depth.
+#
+# WHY NOT CPU
+#
+# The obvious HPA scales on CPU. That is wrong for this workload: a worker
+# blocked on network I/O burns almost no CPU while the backlog grows, so a
+# CPU-based autoscaler sits at minReplicas at exactly the moment you need
+# to scale out. Queue depth is the signal that actually tracks demand.
+#
+# HOW
+#
+# Kubernetes' HPA cannot read Prometheus directly. prometheus-adapter
+# registers itself as an APIService for external.metrics.k8s.io, so the HPA
+# asks the Kubernetes API for a metric and the adapter answers by running a
+# PromQL query.
+#
+# The query uses the goqueue:queue_depth:max recording rule, NOT the raw
+# gauge: every worker reports the same queue-wide number, so summing it
+# would multiply the backlog by the replica count and the autoscaler would
+# chase its own tail.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus-adapter
+  namespace: goqueue
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: goqueue-prometheus-adapter
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "namespaces", "pods", "services"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: goqueue-prometheus-adapter
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: goqueue-prometheus-adapter
+subjects:
+  - kind: ServiceAccount
+    name: prometheus-adapter
+    namespace: goqueue
+---
+# Lets the adapter delegate authn/authz decisions back to the API server,
+# which is required of any aggregated API server.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: goqueue-prometheus-adapter:system:auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: prometheus-adapter
+    namespace: goqueue
+---
+# Lets the adapter read the extension-apiserver-authentication ConfigMap,
+# without which it cannot verify requests from the aggregation layer.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: goqueue-prometheus-adapter-auth-reader
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+  - kind: ServiceAccount
+    name: prometheus-adapter
+    namespace: goqueue
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-adapter-config
+  namespace: goqueue
+data:
+  config.yaml: |
+    # External metrics are cluster-scoped values not tied to a pod, which
+    # is exactly what a queue depth is. (Custom metrics, by contrast, are
+    # per-object - requests-per-second for a specific pod.)
+    externalRules:
+      - seriesQuery: 'goqueue:queue_depth:max{state="pending"}'
+        resources:
+          namespaced: false
+        name:
+          matches: "^goqueue:queue_depth:max$"
+          as: "goqueue_pending_jobs"
+        metricsQuery: 'max(goqueue:queue_depth:max{state="pending"})'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus-adapter
+  namespace: goqueue
+  labels:
+    app.kubernetes.io/name: prometheus-adapter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus-adapter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: prometheus-adapter
+    spec:
+      serviceAccountName: prometheus-adapter
+      containers:
+        - name: adapter
+          image: registry.k8s.io/prometheus-adapter/prometheus-adapter:v0.12.0
+          args:
+            - --prometheus-url=http://prometheus.goqueue.svc.cluster.local:9090
+            - --config=/etc/adapter/config.yaml
+            - --secure-port=6443
+            # Self-signed serving cert. The APIService below sets
+            # insecureSkipTLSVerify, which is acceptable in kind and not
+            # outside it.
+            - --cert-dir=/tmp/cert
+            - --v=4
+          ports:
+            - name: https
+              containerPort: 6443
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+          volumeMounts:
+            - { name: config, mountPath: /etc/adapter }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: config
+          configMap: { name: prometheus-adapter-config }
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-adapter
+  namespace: goqueue
+spec:
+  selector:
+    app.kubernetes.io/name: prometheus-adapter
+  ports:
+    - name: https
+      port: 443
+      targetPort: https
+---
+# Grafts external.metrics.k8s.io onto the Kubernetes API, so the HPA can
+# ask for goqueue_pending_jobs as if it were a built-in metric.
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta1.external.metrics.k8s.io
+spec:
+  service:
+    name: prometheus-adapter
+    namespace: goqueue
+    port: 443
+  group: external.metrics.k8s.io
+  version: v1beta1
+  insecureSkipTLSVerify: true
+  groupPriorityMinimum: 100
+  versionPriority: 100
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: worker
+  namespace: goqueue
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker
+  minReplicas: 2
+  maxReplicas: 12
+  metrics:
+    - type: External
+      external:
+        metric:
+          name: goqueue_pending_jobs
+        target:
+          # AverageValue divides the metric by the replica count, so this
+          # reads as "aim for 5 pending jobs per worker". A backlog of 40
+          # therefore asks for 8 replicas.
+          type: AverageValue
+          averageValue: "5"
+  behavior:
+    scaleUp:
+      # React fast: a backlog is the problem you are trying to fix.
+      stabilizationWindowSeconds: 15
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+    scaleDown:
+      # Retreat slowly. Scaling in aggressively kills workers mid-job and
+      # thrashes when load is bursty.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
