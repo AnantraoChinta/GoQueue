@@ -33,6 +33,17 @@ const (
 	DefaultAckTimeout = 5 * time.Second
 )
 
+// Outcome labels reported to an Observer. A closed set: these become
+// Prometheus label values, and an unbounded set of them would blow up
+// cardinality.
+const (
+	OutcomeSuccess   = "success"
+	OutcomeFailure   = "failure"
+	OutcomeTimeout   = "timeout"
+	OutcomePanic     = "panic"
+	OutcomeNoHandler = "no_handler"
+)
+
 var (
 	// ErrNoHandler means a job arrived whose Type nothing is registered for.
 	// Treated as a job failure, not a pool failure: one bad job type must
@@ -42,6 +53,39 @@ var (
 	// ErrPanic wraps a value recovered from a panicking handler.
 	ErrPanic = errors.New("handler panicked")
 )
+
+// Observer receives job lifecycle events. internal/metrics implements it;
+// the interface lives here so the pool has no dependency on Prometheus and
+// stays testable without a registry.
+//
+// Implementations are called from every worker goroutine and must be safe
+// for concurrent use. They must not block - a slow Observer slows the pool.
+type Observer interface {
+	JobStarted(jobType string)
+	JobFinished(jobType, outcome string, d time.Duration)
+}
+
+// nopObserver is the default, so the pool never nil-checks.
+type nopObserver struct{}
+
+func (nopObserver) JobStarted(string)                         {}
+func (nopObserver) JobFinished(string, string, time.Duration) {}
+
+// Classify maps a job error to one of the Outcome constants.
+func Classify(err error) string {
+	switch {
+	case err == nil:
+		return OutcomeSuccess
+	case errors.Is(err, ErrPanic):
+		return OutcomePanic
+	case errors.Is(err, ErrNoHandler):
+		return OutcomeNoHandler
+	case errors.Is(err, context.DeadlineExceeded):
+		return OutcomeTimeout
+	default:
+		return OutcomeFailure
+	}
+}
 
 // Handler executes one job type. Implementations must respect ctx
 // cancellation, otherwise a hung job will occupy a pool slot until its
@@ -96,6 +140,9 @@ type Pool struct {
 
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
+
+	// Observer receives job lifecycle events. Defaults to a no-op.
+	Observer Observer
 }
 
 // Run starts Size goroutines and blocks until ctx is cancelled and every
@@ -167,12 +214,36 @@ func (p *Pool) workerLoop(ctx context.Context, workerID string) {
 	}
 }
 
-// runJob executes one claimed job and records its outcome.
+// runJob executes one claimed job, reports it to the Observer, and records
+// its outcome in the queue.
 func (p *Pool) runJob(ctx context.Context, workerID string, job *queue.Job) {
+	start := time.Now()
+	p.Observer.JobStarted(job.Type)
+
+	err := p.dispatch(ctx, job)
+
+	elapsed := time.Since(start)
+	// Paired with JobStarted on every path, including the no-handler case,
+	// so the in-flight gauge cannot drift upward over time.
+	p.Observer.JobFinished(job.Type, Classify(err), elapsed)
+
+	p.Logger.Debug("job finished",
+		"worker", workerID,
+		"job", job.ID,
+		"type", job.Type,
+		"attempt", job.Attempts,
+		"duration", elapsed,
+		"outcome", Classify(err),
+		"error", err)
+
+	p.complete(workerID, job, err)
+}
+
+// dispatch looks up the handler and runs it under a bounded context.
+func (p *Pool) dispatch(ctx context.Context, job *queue.Job) error {
 	handler, ok := p.Handlers[job.Type]
 	if !ok {
-		p.complete(workerID, job, fmt.Errorf("%w: %q", ErrNoHandler, job.Type))
-		return
+		return fmt.Errorf("%w: %q", ErrNoHandler, job.Type)
 	}
 
 	// Pass 2 + pass 5. Two things are happening here.
@@ -188,18 +259,7 @@ func (p *Pool) runJob(ctx context.Context, workerID string, job *queue.Job) {
 	jobCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), p.JobTimeout)
 	defer cancel()
 
-	start := time.Now()
-	err := invoke(jobCtx, handler, job)
-
-	p.Logger.Debug("job finished",
-		"worker", workerID,
-		"job", job.ID,
-		"type", job.Type,
-		"attempt", job.Attempts,
-		"duration", time.Since(start),
-		"error", err)
-
-	p.complete(workerID, job, err)
+	return invoke(jobCtx, handler, job)
 }
 
 // invoke calls the handler, converting a panic into an error.
@@ -279,6 +339,9 @@ func (p *Pool) resolve() (*Pool, error) {
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
+	}
+	if c.Observer == nil {
+		c.Observer = nopObserver{}
 	}
 	return &c, nil
 }
