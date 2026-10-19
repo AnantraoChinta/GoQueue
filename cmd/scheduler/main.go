@@ -34,6 +34,7 @@ type config struct {
 	connectTimeout time.Duration
 	shutdownGrace  time.Duration
 	readyTimeout   time.Duration
+	depthInterval  time.Duration
 	logLevel       string
 }
 
@@ -59,6 +60,20 @@ func run() error {
 	defer closeQueue()
 
 	m := metrics.New()
+
+	// The scheduler samples queue depth as well as the workers.
+	//
+	// Found the hard way: the sampler originally lived only in the worker,
+	// so when every worker died the queue-depth series went stale and
+	// GoQueueBacklogGrowing could not fire - precisely the outage where a
+	// growing backlog matters most. Redis showed 80 pending jobs while
+	// Prometheus showed no data at all.
+	//
+	// Schedulers stay up independently of workers, so reporting from here
+	// keeps the backlog visible through a total worker outage. Both
+	// publish the same queue-wide value, which is why every query must
+	// aggregate with max() rather than sum().
+	go sampleQueueDepth(ctx, q, m, cfg.depthInterval, logger)
 
 	srv := &http.Server{
 		Addr:    cfg.addr,
@@ -98,6 +113,44 @@ func run() error {
 	}
 	logger.Info("scheduler stopped")
 	return nil
+}
+
+// sampleQueueDepth polls the queue and publishes the depth gauge.
+func sampleQueueDepth(ctx context.Context, q queue.Queue, m *metrics.Metrics,
+	every time.Duration, logger *slog.Logger) {
+
+	// Optional capability, asserted rather than required on the Queue
+	// interface - the same pattern net/http uses for http.Flusher.
+	type depther interface {
+		Depth(context.Context) (map[queue.State]int, error)
+	}
+	d, ok := q.(depther)
+	if !ok {
+		return
+	}
+
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			counts, err := d.Depth(ctx)
+			if err != nil {
+				logger.Warn("queue depth sample failed", "error", err)
+				continue
+			}
+			// Every state is set explicitly, including zeros: omitting one
+			// would leave its last non-zero value published forever.
+			for _, state := range []queue.State{
+				queue.StatePending, queue.StateClaimed, queue.StateSucceeded,
+				queue.StateFailed, queue.StateDead,
+			} {
+				m.QueueDepth.WithLabelValues(string(state)).Set(float64(counts[state]))
+			}
+		}
+	}
 }
 
 func newHandler(q queue.Queue, m *metrics.Metrics, ready func(*http.Request) error,
@@ -153,6 +206,8 @@ func parseConfig() config {
 		"key prefix, so several environments can share one Redis")
 	flag.DurationVar(&c.shutdownGrace, "shutdown-grace", envDur("GOQUEUE_SHUTDOWN_GRACE", 15*time.Second),
 		"time allowed for in-flight requests to finish on shutdown")
+	flag.DurationVar(&c.depthInterval, "depth-interval", envDur("GOQUEUE_DEPTH_INTERVAL", 5*time.Second),
+		"how often to sample queue depth")
 	flag.DurationVar(&c.readyTimeout, "ready-timeout", envDur("GOQUEUE_READY_TIMEOUT", 2*time.Second),
 		"timeout for the readiness check's Redis ping")
 	flag.StringVar(&c.logLevel, "log-level", envStr("GOQUEUE_LOG_LEVEL", "info"),

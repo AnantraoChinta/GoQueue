@@ -128,6 +128,10 @@ redis-cli:
 k8s-delete:
 	kubectl delete -f deploy/k8s/ --ignore-not-found
 
+## chaos-test: kill worker pods mid-run and prove no job is lost
+chaos-test:
+	./scripts/chaos-test.sh
+
 ## clean: remove build artifacts
 clean:
 	rm -rf $(BIN_DIR)
@@ -136,4 +140,5 @@ clean:
 .PHONY: help build test lint fmt vet tidy run run-worker \
         compose-up compose-down compose-logs compose-ps \
         docker-build kind-up kind-down kind-load \
-        k8s-apply k8s-delete k8s-status k8s-logs redis-ping redis-cli clean
+        k8s-apply k8s-delete k8s-status k8s-logs redis-ping redis-cli \
+        chaos-test clean

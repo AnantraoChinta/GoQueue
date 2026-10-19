@@ -118,10 +118,103 @@ data:
           - record: goqueue:jobs_processed:rate5m
             expr: sum by (type, outcome) (rate(goqueue_jobs_processed_total[5m]))
 
+          # Quantiles are computed from the histogram's buckets, which is
+          # why the bucket boundaries matter: a quantile can only ever be
+          # as precise as the bucket it lands in.
+          - record: goqueue:job_duration_seconds:p50
+            expr: >
+              histogram_quantile(0.50,
+                sum by (type, le) (rate(goqueue_job_duration_seconds_bucket[5m])))
+
           - record: goqueue:job_duration_seconds:p95
             expr: >
               histogram_quantile(0.95,
                 sum by (type, le) (rate(goqueue_job_duration_seconds_bucket[5m])))
+
+          - record: goqueue:job_duration_seconds:p99
+            expr: >
+              histogram_quantile(0.99,
+                sum by (type, le) (rate(goqueue_job_duration_seconds_bucket[5m])))
+
+          # Error ratio as a single series, so alerts and panels agree on
+          # the definition rather than each writing their own.
+          - record: goqueue:job_error_ratio:rate5m
+            expr: >
+              sum(rate(goqueue_jobs_processed_total{outcome!="success"}[5m]))
+              /
+              clamp_min(sum(rate(goqueue_jobs_processed_total[5m])), 0.001)
+
+      - name: goqueue-alerts
+        rules:
+          # Backlog growing faster than workers drain it. `for: 2m` avoids
+          # firing on a normal burst that is already being worked off.
+          - alert: GoQueueBacklogGrowing
+            expr: goqueue:queue_depth:max{state="pending"} > 50
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Job backlog above 50 for 2 minutes"
+              description: >
+                {{ $value }} jobs are pending. Workers are not keeping up;
+                check whether the HPA is scaling and whether a downstream
+                dependency is slow.
+
+          - alert: GoQueueBacklogCritical
+            expr: goqueue:queue_depth:max{state="pending"} > 500
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Job backlog above 500 for 5 minutes"
+              description: >
+                {{ $value }} jobs pending. The HPA has likely hit
+                maxReplicas, or Redis is the bottleneck.
+
+          # Rising error rate. Deliberately a ratio, not a count: absolute
+          # failures scale with traffic, so a count would page on a busy
+          # Tuesday.
+          - alert: GoQueueHighErrorRate
+            expr: goqueue:job_error_ratio:rate5m > 0.10
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Over 10% of jobs failing"
+              description: "{{ $value | humanizePercentage }} of jobs failed over the last 5m."
+
+          - alert: GoQueueJobsDeadLettering
+            expr: increase(goqueue_jobs_processed_total{outcome="failure"}[10m]) > 20
+            for: 0m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Jobs are exhausting their retries"
+              description: >
+                Jobs are reaching the dead-letter queue. These will not be
+                retried automatically and need a human.
+
+          # No workers at all is different from a backlog: the queue could
+          # look healthy while nothing is consuming it.
+          - alert: GoQueueNoWorkersUp
+            expr: absent(up{component="worker"} == 1)
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "No worker is reporting"
+              description: "Every worker target is down or gone. Jobs will accumulate unprocessed."
+
+          # Saturation: every pool slot busy means the pool, not the
+          # queue, is the limit.
+          - alert: GoQueueWorkerPoolSaturated
+            expr: sum(goqueue_jobs_in_flight) >= sum(goqueue_pool_size)
+            for: 10m
+            labels:
+              severity: info
+            annotations:
+              summary: "Worker pools fully saturated for 10 minutes"
+              description: "Every goroutine slot is busy. Raise pool size or replica count."
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -211,6 +304,710 @@ data:
         access: proxy
         url: http://prometheus.goqueue.svc.cluster.local:9090
         isDefault: true
+        # Fixed uid so the provisioned dashboard can bind to this
+        # datasource. Without it Grafana assigns a random uid at startup
+        # and every panel renders "datasource not found".
+        uid: goqueue-prom
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  namespace: goqueue
+data:
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: goqueue
+        orgId: 1
+        type: file
+        disableDeletion: true
+        # Provisioned dashboards are read-only in the UI; edits must go
+        # back into this ConfigMap, which keeps the dashboard in git
+        # rather than in one person's browser.
+        allowUiUpdates: false
+        options:
+          path: /var/lib/grafana/dashboards
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: goqueue
+data:
+  overview.json: |
+    {
+      "uid": "goqueue-overview",
+      "title": "GoQueue Overview",
+      "tags": [
+        "goqueue"
+      ],
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "10s",
+      "time": {
+        "from": "now-30m",
+        "to": "now"
+      },
+      "editable": true,
+      "panels": [
+        {
+          "type": "stat",
+          "title": "Pending",
+          "description": "Jobs waiting to be claimed. The scaling signal.",
+          "gridPos": {
+            "x": 0,
+            "y": 0,
+            "w": 4,
+            "h": 4
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "goqueue-prom"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 50
+                  },
+                  {
+                    "color": "red",
+                    "value": 500
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "goqueue:queue_depth:max{state=\"pending\"}",
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "goqueue-prom"
+              }
+            }
+          ]
+        },
+        {
+          "type": "stat",
+          "title": "In flight",
+          "description": "Jobs currently executing across all workers.",
+          "gridPos": {
+            "x": 4,
+            "y": 0,
+            "w": 4,
+            "h": 4
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "goqueue-prom"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum(goqueue_jobs_in_flight)",
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "goqueue-prom"
+              }
+            }
+          ]
+        },
+        {
+          "type": "stat",
+          "title": "Throughput",
+          "description": "Jobs finished per second, 5m rate.",
+          "gridPos": {
+            "x": 8,
+            "y": 0,
+            "w": 4,
+            "h": 4
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "goqueue-prom"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum(rate(goqueue_jobs_processed_total[5m]))",
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "goqueue-prom"
+              }
+            }
+          ]
+        },
+        {
+          "type": "stat",
+          "title": "Error rate",
+          "description": "Share of jobs not succeeding. A ratio, not a count, so it does not rise with traffic.",
+          "gridPos": {
+            "x": 12,
+            "y": 0,
+            "w": 4,
+            "h": 4
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "goqueue-prom"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 0.05
+                  },
+                  {
+                    "color": "red",
+                    "value": 0.1
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "goqueue:job_error_ratio:rate5m",
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "goqueue-prom"
+              }
+            }
+          ]
+        },
+        {
+          "type": "stat",
+          "title": "Dead-lettered",
+          "description": "Jobs that exhausted their retries. These need a human.",
+          "gridPos": {
+            "x": 16,
+            "y": 0,
+            "w": 4,
+            "h": 4
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "goqueue-prom"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 1
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "goqueue:queue_depth:max{state=\"dead\"}",
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "goqueue-prom"
+              }
+            }
+          ]
+        },
+        {
+          "type": "stat",
+          "title": "Workers up",
+          "description": "",
+          "gridPos": {
+            "x": 20,
+            "y": 0,
+            "w": 4,
+            "h": 4
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "goqueue-prom"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "red",
+                    "value": null
+                  },
+                  {
+                    "color": "green",
+                    "value": 1
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "count(up{component=\"worker\"} == 1)",
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "goqueue-prom"
+              }
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Queue depth by state",
+          "description": "Uses the goqueue:queue_depth:max recording rule. The raw gauge must never be summed: every worker reports the same queue-wide value, so sum() multiplies the backlog by the replica count.",
+          "gridPos": {
+            "x": 0,
+            "y": 4,
+            "w": 12,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "goqueue-prom"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "showPoints": "never"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "goqueue:queue_depth:max{state=\"pending\"}",
+              "legendFormat": "pending",
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "goqueue-prom"
+              }
+            },
+            {
+              "expr": "goqueue:queue_depth:max{state=\"claimed\"}",
+              "legendFormat": "claimed",
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "goqueue-prom"
+              }
+            },
+            {
+              "expr": "goqueue:queue_depth:max{state=\"dead\"}",
+              "legendFormat": "dead",
+              "refId": "C",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "goqueue-prom"
+              }
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Throughput by outcome",
+          "description": "success / failure / timeout / panic / no_handler",
+          "gridPos": {
+            "x": 12,
+            "y": 4,
+            "w": 12,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "goqueue-prom"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "showPoints": "never"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum by (outcome) (rate(goqueue_jobs_processed_total[5m]))",
+              "legendFormat": "{{outcome}}",
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "goqueue-prom"
+              }
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Job latency percentiles",
+          "description": "Computed from the job_duration_seconds histogram buckets.",
+          "gridPos": {
+            "x": 0,
+            "y": 12,
+            "w": 12,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "goqueue-prom"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "showPoints": "never"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "max(goqueue:job_duration_seconds:p50)",
+              "legendFormat": "p50",
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "goqueue-prom"
+              }
+            },
+            {
+              "expr": "max(goqueue:job_duration_seconds:p95)",
+              "legendFormat": "p95",
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "goqueue-prom"
+              }
+            },
+            {
+              "expr": "max(goqueue:job_duration_seconds:p99)",
+              "legendFormat": "p99",
+              "refId": "C",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "goqueue-prom"
+              }
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Latency p99 by job type",
+          "description": "Which job type is slow.",
+          "gridPos": {
+            "x": 12,
+            "y": 12,
+            "w": 12,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "goqueue-prom"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "showPoints": "never"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "goqueue:job_duration_seconds:p99",
+              "legendFormat": "{{type}}",
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "goqueue-prom"
+              }
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Worker saturation",
+          "description": "When these converge the pool is the bottleneck, not the queue.",
+          "gridPos": {
+            "x": 0,
+            "y": 20,
+            "w": 12,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "goqueue-prom"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "showPoints": "never"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum(goqueue_jobs_in_flight)",
+              "legendFormat": "in flight",
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "goqueue-prom"
+              }
+            },
+            {
+              "expr": "sum(goqueue_pool_size)",
+              "legendFormat": "total slots",
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "goqueue-prom"
+              }
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Worker replicas",
+          "description": "Watch this climb when the HPA reacts to a backlog.",
+          "gridPos": {
+            "x": 12,
+            "y": 20,
+            "w": 12,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "goqueue-prom"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "showPoints": "never"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "count(up{component=\"worker\"} == 1)",
+              "legendFormat": "workers up",
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "goqueue-prom"
+              }
+            },
+            {
+              "expr": "count(up{component=\"scheduler\"} == 1)",
+              "legendFormat": "schedulers up",
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "goqueue-prom"
+              }
+            }
+          ]
+        }
+      ]
+    }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -257,11 +1054,19 @@ spec:
           volumeMounts:
             - name: provisioning
               mountPath: /etc/grafana/provisioning/datasources
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
             - name: data
               mountPath: /var/lib/grafana
       volumes:
         - name: provisioning
           configMap: { name: grafana-provisioning }
+        - name: dashboard-provider
+          configMap: { name: grafana-dashboard-provider }
+        - name: dashboards
+          configMap: { name: grafana-dashboards }
         - name: data
           emptyDir: {}
 ---
