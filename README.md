@@ -19,6 +19,7 @@ redelivery after worker death, horizontal scale-out, and operational visibility.
 - [Metrics](#metrics)
 - [Local development](#local-development)
 - [Kubernetes](#kubernetes)
+- [Performance](#performance)
 - [Testing](#testing)
 - [Troubleshooting](#troubleshooting)
 - [Project status](#project-status)
@@ -405,7 +406,37 @@ background job slower than that into `+Inf`.
 >
 > - `goqueue:queue_depth:max`
 > - `goqueue:jobs_processed:rate5m`
-> - `goqueue:job_duration_seconds:p95`
+> - `goqueue:job_duration_seconds:p50` / `:p95` / `:p99`
+> - `goqueue:job_error_ratio:rate5m`
+
+### Dashboards and alerts
+
+A 12-panel Grafana dashboard is provisioned automatically at
+<http://localhost:13000/d/goqueue-overview> once the cluster is up: queue depth
+by state, throughput by outcome, latency percentiles, worker saturation, and
+replica count.
+
+Six alert rules ship in `deploy/k8s/monitoring.yaml` and are visible at
+<http://localhost:19090/alerts>:
+
+| Alert | Fires when |
+| --- | --- |
+| `GoQueueBacklogGrowing` | pending > 50 for 2m |
+| `GoQueueBacklogCritical` | pending > 500 for 5m |
+| `GoQueueHighErrorRate` | > 10% of jobs failing for 5m |
+| `GoQueueJobsDeadLettering` | jobs exhausting their retries |
+| `GoQueueNoWorkersUp` | no worker reporting for 2m |
+| `GoQueueWorkerPoolSaturated` | every pool slot busy for 10m |
+
+They are evaluated by Prometheus and shown in its UI. Routing them to a pager
+needs an Alertmanager, which is not deployed.
+
+> **Why the scheduler also samples queue depth.** Originally only workers did.
+> Testing the alerts revealed that scaling workers to zero left Redis holding
+> 80 pending jobs while Prometheus had *no data at all* for queue depth — so
+> `GoQueueBacklogGrowing` could not fire in precisely the outage it exists for.
+> Schedulers stay up independently of workers, so they publish the gauge too.
+> `GoQueueNoWorkersUp` covers the remaining case where everything is down.
 
 ## Local development
 
@@ -422,6 +453,7 @@ rather than an image rebuild.
 | `make run` / `make run-worker` | run on the host against Compose |
 | `make compose-up` / `compose-down` | Redis `:6379`, Prometheus `:9090`, Grafana `:3000` (admin/admin) |
 | `make compose-ps` / `compose-logs` | status and logs |
+| `make chaos-test` | kill worker pods mid-run and prove no job is lost (needs a cluster) |
 | `make clean` | remove `./bin` and clear the test cache |
 
 ```bash
@@ -534,6 +566,50 @@ t=40s  pending=149  replicas=6   running=12   <- scaled out
 t=60s  pending=0    replicas=12  running=12   <- drained
 ```
 
+## Performance
+
+Measured on an Apple M-series laptop with Redis in Docker Desktop. Reproduce
+with:
+
+```bash
+make compose-up
+go test -run='^$' -bench=BenchmarkPoolRedis -benchtime=3000x ./internal/worker/
+```
+
+| Queue | Pool size | Throughput | Per job |
+| --- | --- | --- | --- |
+| Redis | 1 goroutine | 2,620 jobs/sec | 382 µs |
+| Redis | 10 goroutines | 9,825 jobs/sec | 102 µs |
+| Redis | 50 goroutines | **13,745 jobs/sec** | 73 µs |
+| Redis | claim+ack only, 1 goroutine | 2,489 jobs/sec | 402 µs |
+| MemoryQueue | 1 / 10 / 50 goroutines | ~4,800 jobs/sec (flat) | 207 µs |
+
+Handlers are no-ops, so these measure the queue and pool rather than the work.
+Real throughput is bounded by whatever a handler actually does.
+
+Three things worth reading off that table:
+
+**Concurrency pays, up to a point.** 1 → 10 goroutines is a **3.75x** gain;
+10 → 50 only adds a further 1.4x. Each job costs two Redis round trips, so a
+single goroutine spends most of its life waiting on the network. Adding
+goroutines fills that idle time until Redis itself becomes the constraint.
+
+**A single goroutine is latency-bound, not Redis-bound.** The `claim+ack only`
+row (2,489/sec) is nearly identical to the full pool at size 1 (2,620/sec),
+which says the pool adds almost no overhead — the ceiling is round-trip time.
+
+**MemoryQueue does not scale with pool size.** It is flat at ~4,800 jobs/sec
+whether you give it 1 goroutine or 50, because every operation serialises on
+one mutex. That is fine for its purpose — it exists to test the pool without
+Redis — but it means the Redis implementation is *faster under concurrency*
+than the in-process one. Do not use `MemoryQueue` to reason about production
+throughput.
+
+> **Use `-benchtime=<N>x`, not the default.** Go's default scales iteration
+> count until it hits a time budget; because each iteration here enqueues a
+> job first, the in-memory benchmark ballooned to ~900,000 jobs and took nine
+> minutes. A fixed count keeps the run bounded and comparable.
+
 ## Testing
 
 ```bash
@@ -556,6 +632,47 @@ GOQUEUE_TEST_REDIS=localhost:6379 go test -race ./internal/queue/
 ```
 
 Running `make test` without Redis is not a full run — check for `SKIP` lines.
+
+### Fault injection
+
+`scripts/chaos-test.sh` is the test behind the durability claim. It submits
+long-running jobs, hard-kills worker pods with `--grace-period=0` while those
+jobs are mid-execution, waits for the reaper, and then asserts two things: that
+every job completed, and that some jobs were **actually redelivered**.
+
+```bash
+make kind-up && make docker-build && make kind-load && make k8s-apply
+make chaos-test                 # 60 jobs, 3 kill rounds
+./scripts/chaos-test.sh 20 2    # fewer jobs, faster
+```
+
+A passing run looks like:
+
+```
+submitted:    20
+succeeded:    20
+lost:         0
+redelivered:  10   (attempts > 1, i.e. survived a pod kill)
+
+PASS: all 20 jobs completed despite 2 hard pod kills
+      10 job(s) were orphaned by a kill and recovered by the reaper
+```
+
+**The redelivery assertion matters.** An earlier version of this script used
+3-second jobs and reported 40/40 succeeded with *zero* redeliveries — the
+worker's graceful drain finished the in-flight work before the process died,
+so the reaper was never exercised. The test passed while proving nothing about
+crash recovery. Jobs are now 25 seconds by default so a `SIGKILL` genuinely
+interrupts them, and the script **fails with `INCONCLUSIVE`** if nothing was
+redelivered.
+
+### Benchmarks
+
+```bash
+go test -run='^$' -bench=. -benchtime=3000x ./internal/worker/
+```
+
+See [Performance](#performance) for results and what they mean.
 
 ## Troubleshooting
 
@@ -614,15 +731,22 @@ queue-depth autoscaling.
 - [x] Prometheus metrics on a private registry
 - [x] Multi-stage Dockerfile; ~30MB distroless images
 - [x] Kubernetes: StatefulSet Redis, scheduler and worker Deployments, probes
-- [x] In-cluster Prometheus with service discovery, Grafana, recording rules
-- [x] HorizontalPodAutoscaler on queue depth via prometheus-adapter
+- [x] In-cluster Prometheus with service discovery and recording rules
+- [x] Provisioned Grafana dashboard (12 panels) and six Prometheus alert rules
+- [x] HorizontalPodAutoscaler on queue depth via prometheus-adapter, observed
+      scaling workers 6 -> 12 under a 300-job backlog
+- [x] Throughput benchmarks: 13,745 jobs/sec at a 50-goroutine pool
+- [x] Fault-injection script that hard-kills worker pods mid-job and asserts
+      both zero job loss and that redelivery actually occurred
 
 ### Outstanding
 
 - [ ] CI running `make test lint`, with a Redis service container so the
       contract suite's Redis half actually runs
-- [ ] Grafana dashboards (the datasource is provisioned; no dashboards yet)
 - [ ] Tests for `internal/metrics` and the `cmd/` packages
+- [ ] Pod-level throughput scaling is unmeasured. The benchmarks measure
+      goroutine concurrency within one process; scaling across pods is
+      observed working but its throughput gain has not been quantified.
 - [ ] `StateFailed` is reserved and currently set by nothing — it is intended
       for permanent, non-retryable handler failures
 - [ ] `RedisQueue` targets a single Redis instance; Redis Cluster would need
